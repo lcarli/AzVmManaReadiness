@@ -15,11 +15,13 @@
       - Windows OS: https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-windows
       - Overview:   https://learn.microsoft.com/azure/virtual-network/accelerated-networking-overview
 
-.PARAMETER SubscriptionId
-    One or more subscription IDs. If omitted, every enabled subscription in the tenant is evaluated.
-
 .PARAMETER TenantId
-    (Optional) Azure tenant to use. Useful when the account has access to multiple tenants.
+    (Required) Azure tenant ID. The script authenticates against this tenant and only
+    evaluates subscriptions belonging to it.
+
+.PARAMETER SubscriptionId
+    One or more subscription IDs within the tenant. If omitted, every enabled subscription
+    in the tenant is evaluated.
 
 .PARAMETER OutputCsvPath
     (Optional) Path to a CSV file where the report will be written.
@@ -28,10 +30,10 @@
     Include deallocated/stopped VMs in the report (enabled by default; use -IncludeStopped:$false to scan only running VMs).
 
 .EXAMPLE
-    .\Test-AzVmManaReadiness.ps1 -OutputCsvPath .\mana-report.csv
+    .\Test-AzVmManaReadiness.ps1 -TenantId 00000000-0000-0000-0000-000000000000 -OutputCsvPath .\mana-report.csv
 
 .EXAMPLE
-    .\Test-AzVmManaReadiness.ps1 -SubscriptionId 00000000-0000-0000-0000-000000000000 -Verbose
+    .\Test-AzVmManaReadiness.ps1 -TenantId 00000000-0000-0000-0000-000000000000 -SubscriptionId 11111111-1111-1111-1111-111111111111 -Verbose
 
 .NOTES
     Requires an authenticated Azure CLI (az): run 'az login' first.
@@ -43,11 +45,12 @@
 
 [CmdletBinding()]
 param(
-    [Parameter()]
-    [string[]] $SubscriptionId,
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
+    [string] $TenantId,
 
     [Parameter()]
-    [string] $TenantId,
+    [string[]] $SubscriptionId,
 
     [Parameter()]
     [string] $OutputCsvPath,
@@ -116,18 +119,24 @@ $Script:SupportedLinuxOffers = @(
 
 function Assert-AzCli {
     [CmdletBinding()]
-    param()
+    param(
+        [Parameter(Mandatory)] [string] $TenantId
+    )
     $cmd = Get-Command az -ErrorAction SilentlyContinue
     if (-not $cmd) {
         throw "Azure CLI (az) not found. Install it from: https://aka.ms/installazurecli"
     }
-    try {
-        $null = az account show --only-show-errors 2>$null
+
+    $current = & az account show --only-show-errors -o json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+
+    if (-not $current -or $current.tenantId -ne $TenantId) {
+        Write-Host "Authenticating to tenant $TenantId ..." -ForegroundColor Yellow
+        & az login --tenant $TenantId --only-show-errors -o none
         if ($LASTEXITCODE -ne 0) {
-            throw "Not authenticated. Run 'az login' before executing this script."
+            throw "Failed to authenticate to tenant $TenantId."
         }
-    } catch {
-        throw $_
+    } else {
+        Write-Verbose "Already authenticated to tenant $TenantId as $($current.user.name)."
     }
 }
 
@@ -152,12 +161,10 @@ function Invoke-Az {
 function Get-TargetSubscriptions {
     [CmdletBinding()]
     param(
-        [string[]] $SubscriptionId,
-        [string]   $TenantId
+        [Parameter(Mandatory)] [string]   $TenantId,
+        [string[]] $SubscriptionId
     )
-    $args = @('account','list','--all')
-    if ($TenantId) { $args += @('--query', "[?tenantId=='$TenantId']") }
-    $all = Invoke-Az -Args $args
+    $all = Invoke-Az -Args @('account','list','--all','--query', "[?tenantId=='$TenantId']")
     if (-not $all) { return @() }
 
     $enabled = $all | Where-Object { $_.state -eq 'Enabled' }
@@ -314,16 +321,11 @@ function Get-VmManaReport {
 #region --- Main ---
 
 try {
-    Assert-AzCli
+    Assert-AzCli -TenantId $TenantId
 
-    if ($TenantId) {
-        Write-Verbose "Setting active tenant: $TenantId"
-        $null = az account set --tenant $TenantId --only-show-errors 2>$null
-    }
-
-    $subs = Get-TargetSubscriptions -SubscriptionId $SubscriptionId -TenantId $TenantId
+    $subs = Get-TargetSubscriptions -TenantId $TenantId -SubscriptionId $SubscriptionId
     if (-not $subs -or $subs.Count -eq 0) {
-        Write-Warning 'No enabled subscription found for evaluation.'
+        Write-Warning "No enabled subscription found in tenant $TenantId for evaluation."
         return
     }
 

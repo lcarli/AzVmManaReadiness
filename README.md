@@ -23,27 +23,59 @@ A VM is flagged **ManaReady = true** only if both checks pass.
 ## Usage
 
 ```powershell
-# Scan every enabled subscription in the tenant
-.\Test-AzVmManaReadiness.ps1 -Verbose
+# Scan every enabled subscription in the given tenant
+.\Test-AzVmManaReadiness.ps1 -TenantId <tenant-guid> -Verbose
 
 # Export the full report to CSV
-.\Test-AzVmManaReadiness.ps1 -OutputCsvPath .\mana-report.csv
+.\Test-AzVmManaReadiness.ps1 -TenantId <tenant-guid> -OutputCsvPath .\mana-report.csv
 
-# Limit to specific subscriptions
-.\Test-AzVmManaReadiness.ps1 -SubscriptionId 00000000-0000-0000-0000-000000000000
+# Limit to specific subscriptions inside the tenant
+.\Test-AzVmManaReadiness.ps1 -TenantId <tenant-guid> -SubscriptionId 00000000-0000-0000-0000-000000000000
 
 # Pipe results: list only VMs that are NOT ready
-.\Test-AzVmManaReadiness.ps1 | Where-Object { -not $_.ManaReady } | Format-Table
+.\Test-AzVmManaReadiness.ps1 -TenantId <tenant-guid> | Where-Object { -not $_.ManaReady } | Format-Table
 ```
+
+> The script validates that `az` is signed in to the specified tenant. If not, it runs
+> `az login --tenant <TenantId>` automatically.
 
 ### Parameters
 
-| Parameter         | Description                                                                 |
-|-------------------|-----------------------------------------------------------------------------|
-| `-SubscriptionId` | One or more subscription IDs. Omit to scan all enabled subscriptions.       |
-| `-TenantId`       | Target tenant (useful for multi-tenant accounts).                           |
-| `-OutputCsvPath`  | Path to write the report as CSV.                                            |
-| `-IncludeStopped` | Include deallocated/stopped VMs (default: on).                              |
+| Parameter         | Required | Description                                                       |
+|-------------------|----------|-------------------------------------------------------------------|
+| `-TenantId`       | Yes      | Azure tenant to authenticate against and scope subscriptions to.  |
+| `-SubscriptionId` | No       | One or more subscription IDs within the tenant.                   |
+| `-OutputCsvPath`  | No       | Path to write the report as CSV.                                  |
+| `-IncludeStopped` | No       | Include deallocated/stopped VMs (default: on).                    |
+
+## Sample run
+
+```
+PS> .\Test-AzVmManaReadiness.ps1 -TenantId 1d70d939-06d2-4348-b658-58cb38886348
+
+Starting MANA readiness scan...
+Subscriptions to evaluate: 4
+
+[1/4] Subscription: ME-MngEnvMCAP266581-lramoscostah-3 (4e4f76f7-bfb7-4163-84bd-2a19561451b5)
+  -> Listing VMs...
+     No VMs found.
+[2/4] Subscription: ME-MngEnvMCAP266581-lramoscostah-2 (1c164742-2e07-4d88-a81c-7b1d48d62d38)
+  -> Listing VMs...
+     No VMs found.
+[3/4] Subscription: ME-MngEnvMCAP266581-lramoscostah-1 (97bed3f6-adf3-4c44-a29b-65e148c38d07)
+  -> Listing VMs...
+     No VMs found.
+[4/4] Subscription: ME-MngEnvMCAP266581-lramoscostah-4 (3dc8ff32-42e4-4152-b194-46b704ed70f2)
+  -> Listing VMs...
+     Found 1 VM(s).
+  [OK] Kami-Vm                                  Standard_DS1_v2        size:OK  os:OK
+
+=== MANA Readiness Summary ===
+Total VMs evaluated   : 1
+VMs ready (MANA OK)   : 1
+VMs with size issue   : 0
+VMs with OS issue     : 0
+```
 
 ## Output
 
