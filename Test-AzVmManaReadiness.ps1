@@ -228,8 +228,15 @@ function Get-VmManaReport {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)] $Subscription,
-        [switch] $IncludeStopped
+        [switch] $IncludeStopped,
+        [int]    $SubscriptionIndex = 1,
+        [int]    $SubscriptionTotal = 1
     )
+
+    Write-Host ""
+    Write-Host ("[{0}/{1}] Subscription: " -f $SubscriptionIndex, $SubscriptionTotal) -ForegroundColor Cyan -NoNewline
+    Write-Host ("{0} " -f $Subscription.name) -ForegroundColor White -NoNewline
+    Write-Host ("({0})" -f $Subscription.id) -ForegroundColor DarkGray
 
     Write-Verbose "Selecting subscription '$($Subscription.name)' ($($Subscription.id))"
     $null = az account set --subscription $Subscription.id --only-show-errors
@@ -238,12 +245,27 @@ function Get-VmManaReport {
         return
     }
 
-    # Lists every VM with instance details in a single call.
+    Write-Host "  -> Listing VMs..." -ForegroundColor DarkGray
     $vms = Invoke-Az -Args @('vm','list','--show-details')
-    if (-not $vms) { return }
+    if (-not $vms) {
+        Write-Host "     No VMs found." -ForegroundColor DarkGray
+        return
+    }
 
+    $vmCount = @($vms).Count
+    Write-Host ("     Found {0} VM(s)." -f $vmCount) -ForegroundColor Gray
+
+    $i = 0
     foreach ($vm in $vms) {
-        if (-not $IncludeStopped -and $vm.powerState -ne 'VM running') { continue }
+        $i++
+        Write-Progress -Activity ("Subscription {0}/{1}: {2}" -f $SubscriptionIndex, $SubscriptionTotal, $Subscription.name) `
+                       -Status   ("Checking VM {0}/{1}: {2}" -f $i, $vmCount, $vm.name) `
+                       -PercentComplete ([int](($i / [Math]::Max($vmCount,1)) * 100))
+
+        if (-not $IncludeStopped -and $vm.powerState -ne 'VM running') {
+            Write-Host ("  - {0} [skipped: {1}]" -f $vm.name, $vm.powerState) -ForegroundColor DarkGray
+            continue
+        }
 
         $size       = $vm.hardwareProfile.vmSize
         $osType     = $vm.storageProfile.osDisk.osType
@@ -257,6 +279,12 @@ function Get-VmManaReport {
         $osCheck   = Test-ManaSupportedOs -OsType $osType -Publisher $publisher -Offer $offer -Sku $sku
 
         $manaReady = $sizeCheck.Eligible -and $osCheck.Supported
+
+        $icon  = if ($manaReady) { '[OK]' } else { '[--]' }
+        $color = if ($manaReady) { 'Green' } else { 'Yellow' }
+        $sizeTag = if ($sizeCheck.Eligible) { 'size:OK' } else { 'size:NO' }
+        $osTag   = if ($osCheck.Supported)  { 'os:OK'   } else { 'os:NO'   }
+        Write-Host ("  {0} {1,-40} {2,-22} {3}  {4}" -f $icon, $vm.name, $size, $sizeTag, $osTag) -ForegroundColor $color
 
         [pscustomobject][ordered]@{
             SubscriptionName = $Subscription.name
@@ -278,6 +306,7 @@ function Get-VmManaReport {
             ManaReady        = $manaReady
         }
     }
+    Write-Progress -Activity ("Subscription {0}/{1}: {2}" -f $SubscriptionIndex, $SubscriptionTotal, $Subscription.name) -Completed
 }
 
 #endregion
@@ -298,10 +327,17 @@ try {
         return
     }
 
+    Write-Host ""
+    Write-Host "Starting MANA readiness scan..." -ForegroundColor Cyan
+    Write-Host ("Subscriptions to evaluate: {0}" -f $subs.Count) -ForegroundColor Gray
     Write-Verbose "Subscriptions to evaluate: $($subs.Count)"
 
-    $report = foreach ($sub in $subs) {
-        Get-VmManaReport -Subscription $sub -IncludeStopped:$IncludeStopped
+    $report = @()
+    $idx = 0
+    foreach ($sub in $subs) {
+        $idx++
+        $report += Get-VmManaReport -Subscription $sub -IncludeStopped:$IncludeStopped `
+                                    -SubscriptionIndex $idx -SubscriptionTotal $subs.Count
     }
 
     if ($OutputCsvPath) {
