@@ -4,16 +4,30 @@
 
 .DESCRIPTION
     Iterates over every accessible subscription in the Azure tenant (or only the ones
-    provided), enumerates the VMs and validates:
-      - Whether the VM size family/series is eligible for MANA-capable hardware.
-      - Whether the operating system (image) is supported by MANA.
+    provided) and evaluates each VM against the official MANA compatibility process:
+
+      1. Is the VM size on the official "Applicable VM series" list?
+         - If NO  -> Status = NotApplicable. The customer does not need to do anything;
+                     the VM will not require any MANA-related action.
+      2. If YES, is Accelerated Networking (AN) enabled on any of the VM NICs?
+         - If NO  -> Status = NoActionRequired. Per Microsoft guidance, no action is
+                     required; the VM keeps working normally (NetVSC fallback if it
+                     ever lands on MANA-capable hardware).
+      3. If YES, is the operating system on the MANA-supported list?
+         - YES    -> Status = Ready.
+         - NO     -> Status = ActionRequired. Recommend either resizing to an Intel v6+
+                     series (which supports MANA regardless of OS) or updating the OS
+                     (Linux kernel >= 6.14 / endorsed distro, Windows Server 2016+/Win 11).
+         - UNKNOWN -> Status = Unknown. Likely a custom image; manual verification needed.
+
     Produces a consolidated report (pipeline objects and, optionally, a CSV file).
 
     Official references:
-      - VM Sizes:   https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-existing-sizes
-      - Linux OS:   https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-linux
-      - Windows OS: https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-windows
-      - Overview:   https://learn.microsoft.com/azure/virtual-network/accelerated-networking-overview
+      - Applicable VM Sizes: https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-existing-sizes#applicable-vm-series
+      - Compatibility steps: https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-existing-sizes#compatibility
+      - Linux OS:            https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-linux
+      - Windows OS:          https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-windows
+      - Supported OS list:   https://learn.microsoft.com/azure/virtual-network/accelerated-networking-overview#supported-operating-systems
 
 .PARAMETER TenantId
     (Required) Azure tenant ID. The script authenticates against this tenant and only
@@ -27,7 +41,8 @@
     (Optional) Path to a CSV file where the report will be written.
 
 .PARAMETER IncludeStopped
-    Include deallocated/stopped VMs in the report (enabled by default; use -IncludeStopped:$false to scan only running VMs).
+    Include deallocated/stopped VMs in the report (enabled by default; use -IncludeStopped:$false
+    to scan only running VMs).
 
 .EXAMPLE
     .\Test-AzVmManaReadiness.ps1 -TenantId 00000000-0000-0000-0000-000000000000 -OutputCsvPath .\mana-report.csv
@@ -61,39 +76,72 @@ param(
 
 #region --- Constants / MANA support tables ---
 
-# VM size families/series eligible for MANA-capable hardware (matched against the VM "size" string).
-# Each entry is a regex matching sizes in the 'Standard_<NAME>' format.
-# Source: Microsoft Learn - MANA support for existing VM Sizes.
-$Script:ManaEligibleSizeRegexes = @(
-    # A-family
-    '^Standard_A\d+_v2$',                                                 # Av2
-    # B-family
-    '^Standard_B\d+[a-z]*_v2$',                                           # Bsv2 (and variants like Basv2/Balsv2)
-    # D-family v1/v2 (legacy)
-    '^Standard_D\d+(_v2)?$',                                              # Dv1 / Dv2
-    '^Standard_DS\d+(_v2)?$',                                             # Dsv1 / Dsv2
-    # D-family v3..v6
-    '^Standard_D\d+[a-z]*_v[3-6]$',                                       # Dv3..Dv6 + variants (Ddsv5, Dlsv5, Dpsv6, etc.)
-    '^Standard_DS\d+[a-z]*_v[3-6]$',
-    # E-family v3..v6
-    '^Standard_E\d+[a-z]*_v[3-6]$',                                       # Ev3..Ev6 + variants (Edsv5, Epsv6, etc.)
-    '^Standard_ES\d+[a-z]*_v[3-6]$',
-    # Eb-family (E "boosted" storage)
-    '^Standard_E\d+b[a-z]*_v5$',                                          # Ebsv5 / Ebdsv5
-    # F-family
-    '^Standard_F\d+$',                                                    # F
-    '^Standard_F\d+s$',                                                   # Fs
-    '^Standard_F\d+s_v2$',                                                # Fsv2
-    # G-family
-    '^Standard_G\d+$',                                                    # G
-    '^Standard_GS\d+$',                                                   # Gs
-    # L-family
-    '^Standard_L\d+[a-z]*(_v\d+)?$'                                       # Ls / Lsv2 / Lsv3 ...
+# VM size families/series on the official "Applicable VM series" list for MANA.
+# Each entry is a regex matching size strings in 'Standard_<NAME>' format.
+# Source: https://learn.microsoft.com/azure/virtual-network/accelerated-networking-mana-existing-sizes#applicable-vm-series
+#
+# Important: AMD variants (e.g. Dasv4, Dasv5, Dadsv5, Easv4, Easv5) are intentionally
+# excluded - they are not on the applicable list. Likewise Intel v6 series (Dsv6, Esv6)
+# are NOT applicable because they are already MANA-optimized by design (the recommended
+# resize target, not a series needing verification).
+$Script:ManaApplicableSizeRegexes = @(
+    # ---- A-family (Intel) ----
+    '^Standard_A\d+m?_v2$',                                  # Av2 (incl. A2m_v2 / A4m_v2 / A8m_v2)
+
+    # ---- B-family (Intel only; AMD variants like Basv2/Balsv2 are excluded) ----
+    '^Standard_B\d+[mt]?s_v2$',                              # Bsv2, Bmsv2 (B*ms_v2), Btsv2 (B*ts_v2)
+
+    # ---- D-family v1 / v2 (legacy Intel) ----
+    '^Standard_D\d+(-\d+)?$',                                # Dv1
+    '^Standard_DS\d+(-\d+)?$',                               # Dsv1
+    '^Standard_D\d+(-\d+)?_v2$',                             # Dv2
+    '^Standard_DS\d+(-\d+)?_v2$',                            # Dsv2
+
+    # ---- D-family v3 (Intel) ----
+    '^Standard_D\d+(-\d+)?s?_v3$',                           # Dv3, Dsv3
+
+    # ---- D-family v4 (Intel) ----
+    '^Standard_D\d+(-\d+)?d?s?_v4$',                         # Dv4, Dsv4, Ddv4, Ddsv4
+
+    # ---- D-family v5 (Intel) ----
+    '^Standard_D\d+(-\d+)?(s|d|ds|ls|lds)?_v5$',             # Dv5, Dsv5, Ddv5, Ddsv5, Dlsv5, Dldsv5
+
+    # ---- D-family v6 (ARM Cobalt only - Intel/AMD v6 NOT in the applicable list) ----
+    '^Standard_D\d+(-\d+)?p(s|ds|ls|lds)_v6$',               # Dpsv6, Dpdsv6, Dplsv6, Dpldsv6
+
+    # ---- E-family v3 (Intel) ----
+    '^Standard_E\d+(-\d+)?i?s?_v3$',                         # Ev3, Esv3 (incl. isolated 'i' and constrained-core)
+
+    # ---- E-family v4 (Intel) ----
+    '^Standard_E\d+(-\d+)?i?d?s?_v4$',                       # Ev4, Esv4, Edv4, Edsv4 (incl. isolated)
+
+    # ---- E-family v5 (Intel) ----
+    '^Standard_E\d+(-\d+)?i?d?s?_v5$',                       # Ev5, Esv5, Edv5, Edsv5 (incl. isolated)
+
+    # ---- E-family v6 (ARM Cobalt only) ----
+    '^Standard_E\d+(-\d+)?pd?s_v6$',                         # Epsv6, Epdsv6
+
+    # ---- Eb-family v5 (Intel, block-storage performance) ----
+    '^Standard_E\d+(-\d+)?bd?s_v5$',                         # Ebsv5, Ebdsv5
+
+    # ---- F-family ----
+    '^Standard_F\d+$',                                       # F (v1)
+    '^Standard_F\d+s$',                                      # Fs (v1)
+    '^Standard_F\d+s_v2$',                                   # Fsv2
+
+    # ---- G-family ----
+    '^Standard_G\d+(-\d+)?$',                                # G
+    '^Standard_GS\d+(-\d+)?$',                               # Gs (incl. constrained-core)
+
+    # ---- L-family (Ls*) ----
+    '^Standard_L\d+s$',                                      # Ls (v1)
+    '^Standard_L\d+s_v2$',                                   # Lsv2
+    '^Standard_L\d+(d|a|da)?s_v3$'                           # Lsv3, Ldsv3, Lasv3, Ldasv3
 )
 
-# Operating systems supported by MANA. Used as a heuristic match against
+# Operating systems supported by MANA - used as a heuristic match against
 # the (publisher, offer, sku) of the VM image.
-# Source: Accelerated Networking Overview - Supported operating systems.
+# Source: https://learn.microsoft.com/azure/virtual-network/accelerated-networking-overview#supported-operating-systems
 $Script:SupportedWindowsSkuPatterns = @(
     '2016', '2019', '2022',          # Windows Server
     'win11', 'windows-11'             # Windows 11
@@ -174,20 +222,24 @@ function Get-TargetSubscriptions {
     return $enabled
 }
 
-function Test-ManaEligibleSize {
+function Test-ManaApplicableSize {
+    <#
+    .SYNOPSIS
+        Returns whether the VM size is on the MANA "Applicable VM series" list.
+    #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string] $VmSize)
 
-    foreach ($pattern in $Script:ManaEligibleSizeRegexes) {
+    foreach ($pattern in $Script:ManaApplicableSizeRegexes) {
         if ($VmSize -match $pattern) {
             return [pscustomobject]@{
-                Eligible       = $true
+                Applicable     = $true
                 MatchedPattern = $pattern
             }
         }
     }
     return [pscustomobject]@{
-        Eligible       = $false
+        Applicable     = $false
         MatchedPattern = $null
     }
 }
@@ -196,6 +248,7 @@ function Test-ManaSupportedOs {
     <#
     .SYNOPSIS
         Heuristic check to determine whether the VM image/OS is supported by MANA.
+        Returns Supported = $true / $false / $null (unknown - e.g. custom image).
     #>
     [CmdletBinding()]
     param(
@@ -204,6 +257,10 @@ function Test-ManaSupportedOs {
         [string] $Offer,
         [string] $Sku
     )
+
+    if ([string]::IsNullOrWhiteSpace($Publisher) -and [string]::IsNullOrWhiteSpace($Offer)) {
+        return [pscustomobject]@{ Supported = $null; Reason = 'Unknown OS - no marketplace image metadata (likely a custom image).' }
+    }
 
     $pub   = ($Publisher ?? '').ToLowerInvariant()
     $off   = ($Offer    ?? '').ToLowerInvariant()
@@ -227,7 +284,77 @@ function Test-ManaSupportedOs {
         return [pscustomobject]@{ Supported=$false; Reason='Linux distribution/version not in the supported list. Requires kernel >= 6.14 or an endorsed image.' }
     }
     else {
-        return [pscustomobject]@{ Supported=$false; Reason="Unknown OsType ('$OsType'). Possibly a custom image." }
+        return [pscustomobject]@{ Supported = $null; Reason = "Unknown OsType ('$OsType') - possibly a custom image." }
+    }
+}
+
+function Get-NicAcceleratedNetworkingMap {
+    <#
+    .SYNOPSIS
+        Returns a hashtable mapping NIC ID (lower-cased) -> bool for AcceleratedNetworking.
+        Returns $null if the underlying az call failed (so the caller can treat AN as Unknown).
+    #>
+    [CmdletBinding()]
+    param()
+
+    $nics = Invoke-Az -Args @('network','nic','list','--query','[].{id:id, enableAcceleratedNetworking:enableAcceleratedNetworking}')
+    if ($null -eq $nics) {
+        return $null
+    }
+    $map = @{}
+    foreach ($nic in $nics) {
+        if ($nic.id) {
+            $map[$nic.id.ToLowerInvariant()] = [bool]$nic.enableAcceleratedNetworking
+        }
+    }
+    return $map
+}
+
+function Get-VmAcceleratedNetworkingStatus {
+    <#
+    .SYNOPSIS
+        Computes per-VM Accelerated Networking status from the NIC map.
+
+        Enabled = $true   -> at least one NIC has AN enabled
+                = $false  -> all NICs reported and none have AN enabled
+                = $null   -> at least one NIC could not be looked up (status partially unknown)
+                             AND no NIC was found to have AN enabled
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)] $Vm,
+        [hashtable] $NicMap
+    )
+
+    $nicRefs = @($Vm.networkProfile.networkInterfaces)
+    if ($nicRefs.Count -eq 0) {
+        return [pscustomobject]@{
+            Enabled          = $null
+            NicCount         = 0
+            AcceleratedCount = 0
+        }
+    }
+
+    $accel   = 0
+    $missing = 0
+    foreach ($ref in $nicRefs) {
+        $key = if ($ref.id) { $ref.id.ToLowerInvariant() } else { $null }
+        if ($null -ne $NicMap -and $key -and $NicMap.ContainsKey($key)) {
+            if ($NicMap[$key]) { $accel++ }
+        } else {
+            $missing++
+        }
+    }
+
+    $enabled =
+        if ($accel -gt 0)    { $true }
+        elseif ($missing -gt 0) { $null }    # some NICs unknown; can't claim disabled
+        else                  { $false }
+
+    return [pscustomobject]@{
+        Enabled          = $enabled
+        NicCount         = $nicRefs.Count
+        AcceleratedCount = $accel
     }
 }
 
@@ -262,6 +389,14 @@ function Get-VmManaReport {
     $vmCount = @($vms).Count
     Write-Host ("     Found {0} VM(s)." -f $vmCount) -ForegroundColor Gray
 
+    Write-Host "  -> Fetching NIC Accelerated Networking status..." -ForegroundColor DarkGray
+    $nicMap = Get-NicAcceleratedNetworkingMap
+    if ($null -eq $nicMap) {
+        Write-Warning "     Could not list NICs in this subscription; AN status will be reported as Unknown."
+    } else {
+        Write-Host ("     Found {0} NIC(s)." -f $nicMap.Count) -ForegroundColor Gray
+    }
+
     $i = 0
     foreach ($vm in $vms) {
         $i++
@@ -282,35 +417,89 @@ function Get-VmManaReport {
         $sku        = $imgRef.sku
         $exactImg   = $imgRef.exactVersion
 
-        $sizeCheck = Test-ManaEligibleSize -VmSize $size
-        $osCheck   = Test-ManaSupportedOs -OsType $osType -Publisher $publisher -Offer $offer -Sku $sku
+        $sizeCheck = Test-ManaApplicableSize -VmSize $size
 
-        $manaReady = $sizeCheck.Eligible -and $osCheck.Supported
+        # Defaults (overwritten by the decision tree below).
+        $anStatus       = [pscustomobject]@{ Enabled = $null; NicCount = 0; AcceleratedCount = 0 }
+        $osCheck        = [pscustomobject]@{ Supported = $null; Reason = 'Not evaluated (VM size not applicable).' }
+        $status         = $null
+        $recommendation = $null
+        $actionRequired = $false
 
-        $icon  = if ($manaReady) { '[OK]' } else { '[--]' }
-        $color = if ($manaReady) { 'Green' } else { 'Yellow' }
-        $sizeTag = if ($sizeCheck.Eligible) { 'size:OK' } else { 'size:NO' }
-        $osTag   = if ($osCheck.Supported)  { 'os:OK'   } else { 'os:NO'   }
-        Write-Host ("  {0} {1,-40} {2,-22} {3}  {4}" -f $icon, $vm.name, $size, $sizeTag, $osTag) -ForegroundColor $color
+        if (-not $sizeCheck.Applicable) {
+            # Step 1: VM size is not on the MANA-applicable list -> nothing to do.
+            $status         = 'NotApplicable'
+            $recommendation = "VM size '$size' is not on the MANA 'Applicable VM series' list. No action required."
+        }
+        else {
+            # The size IS applicable - apply steps 2 and 3 from the official compatibility flow.
+            $anStatus = Get-VmAcceleratedNetworkingStatus -Vm $vm -NicMap $nicMap
+            $osCheck  = Test-ManaSupportedOs -OsType $osType -Publisher $publisher -Offer $offer -Sku $sku
+
+            if ($anStatus.Enabled -eq $false) {
+                # Step 2: AN disabled -> per Microsoft Learn, no action required.
+                $status         = 'NoActionRequired'
+                $recommendation = 'Accelerated Networking is disabled on all NICs. Per Microsoft guidance, no action is required; the VM will keep working normally (NetVSC fallback if it ever lands on MANA-capable hardware).'
+            }
+            elseif ($anStatus.Enabled -eq $true) {
+                # Step 3: AN enabled -> OS must support MANA.
+                if ($osCheck.Supported -eq $true) {
+                    $status         = 'Ready'
+                    $recommendation = 'MANA-ready: VM size is applicable, Accelerated Networking is enabled, and the OS is on the supported list.'
+                }
+                elseif ($osCheck.Supported -eq $false) {
+                    $status         = 'ActionRequired'
+                    $actionRequired = $true
+                    $recommendation = "Action required: OS is not on the MANA-supported list. Resize to an Intel v6+ VM series (supports MANA regardless of OS) OR update the OS (Linux kernel >= 6.14 / endorsed distro, Windows Server 2016+/Windows 11). Reason: $($osCheck.Reason)"
+                }
+                else {
+                    $status         = 'Unknown'
+                    $recommendation = 'OS support could not be determined (likely a custom image). Verify manually that the OS supports MANA, or resize to an Intel v6+ VM series.'
+                }
+            }
+            else {
+                # AN status itself is unknown.
+                $status         = 'Unknown'
+                $recommendation = 'Accelerated Networking status could not be determined for one or more NICs. Re-run with sufficient NIC read permissions, or verify manually in the Azure portal.'
+            }
+        }
+
+        switch ($status) {
+            'NotApplicable'    { $icon = '[N/A]'; $color = 'DarkGray'    }
+            'NoActionRequired' { $icon = '[OK] '; $color = 'Green'       }
+            'Ready'            { $icon = '[OK] '; $color = 'Green'       }
+            'ActionRequired'   { $icon = '[!!] '; $color = 'Yellow'      }
+            'Unknown'          { $icon = '[??] '; $color = 'DarkYellow'  }
+            default            { $icon = '[?? ]'; $color = 'Gray'        }
+        }
+        Write-Host ("  {0} {1,-40} {2,-22} {3}" -f $icon, $vm.name, $size, $status) -ForegroundColor $color
+
+        $manaReady = ($status -eq 'Ready')
 
         [pscustomobject][ordered]@{
-            SubscriptionName = $Subscription.name
-            SubscriptionId   = $Subscription.id
-            ResourceGroup    = $vm.resourceGroup
-            VmName           = $vm.name
-            Location         = $vm.location
-            PowerState       = $vm.powerState
-            VmSize           = $size
-            SizeEligible     = $sizeCheck.Eligible
-            SizePattern      = $sizeCheck.MatchedPattern
-            OsType           = $osType
-            ImagePublisher   = $publisher
-            ImageOffer       = $offer
-            ImageSku         = $sku
-            ImageVersion     = $exactImg
-            OsSupported      = $osCheck.Supported
-            OsReason         = $osCheck.Reason
-            ManaReady        = $manaReady
+            SubscriptionName             = $Subscription.name
+            SubscriptionId               = $Subscription.id
+            ResourceGroup                = $vm.resourceGroup
+            VmName                       = $vm.name
+            Location                     = $vm.location
+            PowerState                   = $vm.powerState
+            VmSize                       = $size
+            SizeApplicable               = $sizeCheck.Applicable
+            SizePattern                  = $sizeCheck.MatchedPattern
+            AcceleratedNetworkingEnabled = $anStatus.Enabled
+            NicCount                     = $anStatus.NicCount
+            AcceleratedNicCount          = $anStatus.AcceleratedCount
+            OsType                       = $osType
+            ImagePublisher               = $publisher
+            ImageOffer                   = $offer
+            ImageSku                     = $sku
+            ImageVersion                 = $exactImg
+            OsSupported                  = $osCheck.Supported
+            OsReason                     = $osCheck.Reason
+            Status                       = $status
+            ActionRequired               = $actionRequired
+            Recommendation               = $recommendation
+            ManaReady                    = $manaReady
         }
     }
     Write-Progress -Activity ("Subscription {0}/{1}: {2}" -f $SubscriptionIndex, $SubscriptionTotal, $Subscription.name) -Completed
@@ -348,17 +537,23 @@ try {
     }
 
     # Aggregated summary
-    $total       = ($report | Measure-Object).Count
-    $ready       = ($report | Where-Object ManaReady).Count
-    $sizeIssues  = ($report | Where-Object { -not $_.SizeEligible }).Count
-    $osIssues    = ($report | Where-Object { -not $_.OsSupported }).Count
+    $total          = ($report | Measure-Object).Count
+    $notApplicable  = ($report | Where-Object { $_.Status -eq 'NotApplicable'   }).Count
+    $applicable     = $total - $notApplicable
+    $ready          = ($report | Where-Object { $_.Status -eq 'Ready'           }).Count
+    $noAction       = ($report | Where-Object { $_.Status -eq 'NoActionRequired'}).Count
+    $actionRequired = ($report | Where-Object { $_.Status -eq 'ActionRequired'  }).Count
+    $unknown        = ($report | Where-Object { $_.Status -eq 'Unknown'         }).Count
 
     Write-Host ''
     Write-Host '=== MANA Readiness Summary ===' -ForegroundColor Cyan
-    Write-Host ("Total VMs evaluated   : {0}" -f $total)
-    Write-Host ("VMs ready (MANA OK)   : {0}" -f $ready)        -ForegroundColor Green
-    Write-Host ("VMs with size issue   : {0}" -f $sizeIssues)   -ForegroundColor Yellow
-    Write-Host ("VMs with OS issue     : {0}" -f $osIssues)     -ForegroundColor Yellow
+    Write-Host ("Total VMs scanned          : {0}" -f $total)
+    Write-Host ("  Not applicable           : {0}" -f $notApplicable)   -ForegroundColor DarkGray
+    Write-Host ("  Applicable               : {0}" -f $applicable)
+    Write-Host ("    Ready (MANA OK)        : {0}" -f $ready)           -ForegroundColor Green
+    Write-Host ("    No action (AN off)     : {0}" -f $noAction)        -ForegroundColor Green
+    Write-Host ("    Action required        : {0}" -f $actionRequired)  -ForegroundColor Yellow
+    Write-Host ("    Unknown (verify)       : {0}" -f $unknown)         -ForegroundColor DarkYellow
     Write-Host ''
 
     # Emit objects to the pipeline for downstream use.
